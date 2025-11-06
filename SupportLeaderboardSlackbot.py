@@ -1,58 +1,22 @@
 import os
 import sys
 import time
-import re
 from datetime import datetime, timedelta
 from collections import Counter
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 # Configuration
-SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "xoxb-your-token-here")  # Prefer environment variable
-TRACKING_CHANNEL_ID = os.environ.get("TRACKING_CHANNEL_ID", "C01ABC2DEF3")  # Prefer environment variable
-WORKFLOW_BOT_ID = None  # Will be auto-detected from tracking channel messages
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "xoxb-your-token-here")
+SUPPORT_CHANNEL_ID = os.environ.get("SUPPORT_CHANNEL_ID", "C01ABC2DEF3")  # #product-support-quick-questions
+LEADERBOARD_CHANNEL_ID = os.environ.get("LEADERBOARD_CHANNEL_ID", "C01ABC2DEF3")  # Where to post leaderboard
+RESOLUTION_EMOJI = "white_check_mark"  # The ✅ emoji (without colons)
 
 # Rate limiting configuration
 MAX_RETRIES = 3
 INITIAL_RETRY_DELAY = 1  # seconds
 
-# Expected workflow message format validation
-WORKFLOW_MESSAGE_PATTERN = re.compile(r"✅.*Thread resolved by <@[A-Z0-9]+>", re.IGNORECASE)
-
 client = WebClient(token=SLACK_BOT_TOKEN)
-
-def detect_workflow_bot_id():
-    """
-    Auto-detect the bot ID of the workflow by examining recent messages in tracking channel.
-    This ensures we only count messages from the official workflow.
-    """
-    global WORKFLOW_BOT_ID
-    
-    if WORKFLOW_BOT_ID:
-        return WORKFLOW_BOT_ID
-    
-    try:
-        # Fetch recent messages to find the workflow bot
-        result = retry_api_call(
-            lambda: client.conversations_history(
-                channel=TRACKING_CHANNEL_ID,
-                limit=100
-            )
-        )
-        
-        # Look for messages with the workflow pattern from a bot
-        for message in result.get("messages", []):
-            if "bot_id" in message and WORKFLOW_MESSAGE_PATTERN.search(message.get("text", "")):
-                WORKFLOW_BOT_ID = message["bot_id"]
-                print(f"Detected workflow bot ID: {WORKFLOW_BOT_ID}")
-                return WORKFLOW_BOT_ID
-        
-        print("Warning: Could not auto-detect workflow bot ID. Will count all matching messages.")
-        return None
-        
-    except Exception as e:
-        print(f"Warning: Error detecting workflow bot ID: {e}")
-        return None
 
 def retry_api_call(api_func, max_retries=MAX_RETRIES):
     """
@@ -110,98 +74,34 @@ def get_week_range(weeks_ago=0):
     
     return last_monday, last_sunday
 
-def is_valid_workflow_message(message):
+def get_channel_messages(channel_id, start_date, end_date):
     """
-    Validate that a message came from the official workflow.
-    Checks bot_id and message format.
+    Fetch messages from a channel within a date range.
+    Uses conversations.history which works with basic channel access.
     """
-    # Must be from a bot
-    if "bot_id" not in message:
-        return False
-    
-    # If we detected the workflow bot ID, verify it matches
-    if WORKFLOW_BOT_ID and message["bot_id"] != WORKFLOW_BOT_ID:
-        return False
-    
-    # Check message format matches workflow pattern
-    message_text = message.get("text", "")
-    if not WORKFLOW_MESSAGE_PATTERN.search(message_text):
-        return False
-    
-    return True
-
-def extract_resolver_from_message(message):
-    """
-    Extract the user who resolved the thread from the workflow message.
-    Returns user ID extracted from the message text.
-    """
-    message_text = message.get("text", "")
-    
-    # Extract user mention from "Thread resolved by <@U12345>"
-    match = re.search(r"<@([A-Z0-9]+)>", message_text)
-    if match:
-        return match.group(1)
-    
-    return None
-
-def check_for_duplicate_leaderboard(start_date, end_date):
-    """
-    Check if a leaderboard has already been posted for this week.
-    Returns True if duplicate detected.
-    """
-    try:
-        # Search for existing leaderboards in the channel
-        date_range_str = f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}"
-        
-        # Fetch recent messages to check for duplicates
-        result = retry_api_call(
-            lambda: client.conversations_history(
-                channel=TRACKING_CHANNEL_ID,
-                limit=100  # Check last 100 messages
-            )
-        )
-        
-        for message in result.get("messages", []):
-            # Check if message is from this bot and contains the same date range
-            if message.get("bot_id") and "Weekly Resolution Leaderboard" in message.get("text", ""):
-                if date_range_str in message.get("text", ""):
-                    return True
-        
-        return False
-        
-    except Exception as e:
-        print(f"Warning: Error checking for duplicate leaderboard: {e}")
-        return False  # Proceed with caution if check fails
-
-def get_resolutions_for_week(start_date, end_date):
-    """
-    Fetch all valid resolution messages from tracking channel for the given week.
-    Validates messages and deduplicates by thread.
-    """
-    resolutions = Counter()
-    seen_threads = set()  # Track unique threads to prevent double-counting
-    
     # Convert to Unix timestamps
     oldest = start_date.timestamp()
     latest = end_date.timestamp()
     
+    all_messages = []
+    cursor = None
+    
     try:
-        # Fetch messages from the channel with pagination support
-        cursor = None
-        all_messages = []
-        
         while True:
-            result = retry_api_call(
-                lambda: client.conversations_history(
-                    channel=TRACKING_CHANNEL_ID,
-                    oldest=str(oldest),
-                    latest=str(latest),
-                    limit=200,  # Slack's max per request
-                    cursor=cursor
-                )
-            )
+            kwargs = {
+                "channel": channel_id,
+                "oldest": str(oldest),
+                "latest": str(latest),
+                "limit": 200  # Slack's max per request
+            }
             
-            all_messages.extend(result.get("messages", []))
+            if cursor:
+                kwargs["cursor"] = cursor
+            
+            result = retry_api_call(lambda: client.conversations_history(**kwargs))
+            
+            messages = result.get("messages", [])
+            all_messages.extend(messages)
             
             # Check if there are more messages
             cursor = result.get("response_metadata", {}).get("next_cursor")
@@ -211,62 +111,157 @@ def get_resolutions_for_week(start_date, end_date):
             # Small delay to avoid rate limiting on pagination
             time.sleep(0.5)
         
-        print(f"Fetched {len(all_messages)} total messages from tracking channel")
+        return all_messages
         
-        # Process and validate messages
-        valid_count = 0
-        invalid_count = 0
-        duplicate_count = 0
+    except SlackApiError as e:
+        print(f"Error fetching messages: {e.response.get('error', 'Unknown error')}")
+        raise
+
+def get_reactions_for_message(channel_id, timestamp):
+    """
+    Get all reactions for a specific message.
+    Returns a dict of {emoji_name: [list of user_ids]}
+    """
+    try:
+        result = retry_api_call(
+            lambda: client.reactions_get(
+                channel=channel_id,
+                timestamp=timestamp,
+                full=True  # Get full user info
+            )
+        )
         
-        for message in all_messages:
-            # Validate message is from workflow
-            if not is_valid_workflow_message(message):
-                invalid_count += 1
-                continue
-            
-            valid_count += 1
-            
-            # Extract thread identifier to detect duplicates
-            message_text = message.get("text", "")
-            thread_match = re.search(r"Thread: (https://[^\s]+)", message_text)
-            
-            if thread_match:
-                thread_url = thread_match.group(1)
+        message = result.get("message", {})
+        reactions = message.get("reactions", [])
+        
+        reaction_data = {}
+        for reaction in reactions:
+            emoji_name = reaction.get("name")
+            users = reaction.get("users", [])
+            reaction_data[emoji_name] = users
+        
+        return reaction_data
+        
+    except SlackApiError as e:
+        # Message might not have reactions or might be deleted
+        if e.response.get("error") == "message_not_found":
+            return {}
+        print(f"Warning: Could not get reactions for message: {e.response.get('error', 'Unknown error')}")
+        return {}
+
+def count_resolutions_by_reactions(channel_id, start_date, end_date):
+    """
+    Count resolutions by finding all messages with the resolution emoji reaction
+    within the date range, then counting who added those reactions.
+    """
+    print(f"\nFetching messages from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}...")
+    
+    # Get all messages in the date range
+    messages = get_channel_messages(channel_id, start_date, end_date)
+    print(f"Found {len(messages)} messages in date range")
+    
+    # Track resolutions per user
+    resolutions = Counter()
+    resolved_threads = 0
+    messages_checked = 0
+    
+    print("\nChecking messages for resolution reactions...")
+    
+    for i, message in enumerate(messages):
+        messages_checked += 1
+        
+        # Progress indicator for large channels
+        if (i + 1) % 50 == 0:
+            print(f"  Checked {i + 1}/{len(messages)} messages...")
+        
+        # Check if message has any reactions
+        if not message.get("reactions"):
+            continue
+        
+        # Check if the resolution emoji is present
+        has_resolution_emoji = any(
+            r.get("name") == RESOLUTION_EMOJI 
+            for r in message.get("reactions", [])
+        )
+        
+        if not has_resolution_emoji:
+            continue
+        
+        resolved_threads += 1
+        
+        # Get detailed reaction info to see who added the resolution emoji
+        timestamp = message.get("ts")
+        reactions = get_reactions_for_message(channel_id, timestamp)
+        
+        # Get users who added the resolution emoji
+        resolver_ids = reactions.get(RESOLUTION_EMOJI, [])
+        
+        # Count resolution for each user who added the emoji
+        for user_id in resolver_ids:
+            try:
+                user_info = retry_api_call(
+                    lambda: client.users_info(user=user_id)
+                )
+                user_name = user_info["user"]["real_name"]
                 
-                # Skip if we've already counted this thread
-                if thread_url in seen_threads:
-                    duplicate_count += 1
+                # Skip bot users
+                if user_info["user"].get("is_bot"):
                     continue
                 
-                seen_threads.add(thread_url)
-            
-            # Extract the resolver user ID
-            user_id = extract_resolver_from_message(message)
-            
-            if user_id:
-                # Get user's real name with retry logic
-                try:
-                    user_info = retry_api_call(
-                        lambda: client.users_info(user=user_id)
-                    )
-                    user_name = user_info["user"]["real_name"]
-                    resolutions[user_name] += 1
-                    
-                except Exception as e:
-                    print(f"Warning: Could not fetch user info for {user_id}: {e}")
-                    # Use user ID as fallback
-                    resolutions[f"User {user_id}"] += 1
+                resolutions[user_name] += 1
+                
+            except Exception as e:
+                print(f"Warning: Could not fetch user info for {user_id}: {e}")
+                resolutions[f"User {user_id}"] += 1
         
-        print(f"Processed {valid_count} valid workflow messages, {invalid_count} invalid, {duplicate_count} duplicates")
+        # Small delay to avoid rate limiting
+        if resolved_threads % 10 == 0:
+            time.sleep(0.3)
+    
+    print(f"\n✓ Processed {messages_checked} messages")
+    print(f"✓ Found {resolved_threads} resolved threads")
+    print(f"✓ Counted {sum(resolutions.values())} total resolution reactions")
+    
+    return resolutions
+
+def check_for_duplicate_leaderboard(channel_id, start_date, end_date):
+    """
+    Check if a leaderboard has already been posted for this week.
+    Returns True if duplicate detected.
+    """
+    try:
+        date_range_str = f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}"
         
-        return resolutions
+        # Get bot's own user ID to filter its messages
+        auth_result = retry_api_call(lambda: client.auth_test())
+        bot_user_id = auth_result.get("user_id")
+        
+        # Fetch recent messages from leaderboard channel
+        result = retry_api_call(
+            lambda: client.conversations_history(
+                channel=channel_id,
+                limit=100
+            )
+        )
+        
+        for message in result.get("messages", []):
+            # Check if message is from this bot
+            if message.get("user") != bot_user_id:
+                continue
+            
+            # Check if it's a leaderboard with this date range
+            message_text = message.get("text", "")
+            if "Weekly Resolution Leaderboard" in message_text and date_range_str in message_text:
+                return True
+        
+        return False
         
     except Exception as e:
-        print(f"Error fetching messages: {e}")
-        return resolutions
+        print(f"Warning: Error checking for duplicate leaderboard: {e}")
+        return False
 
-def post_leaderboard(resolutions, start_date, end_date):
-    """Post the leaderboard to the tracking channel"""
+def post_leaderboard(resolutions, start_date, end_date, channel_id):
+    """Post the leaderboard to the specified channel"""
     
     # Format the date range
     date_range = f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}"
@@ -332,40 +327,42 @@ def post_leaderboard(resolutions, start_date, end_date):
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": "_No resolutions logged this week._"
+                "text": "_No resolutions found this week._"
             }
         })
     
     try:
         retry_api_call(
             lambda: client.chat_postMessage(
-                channel=TRACKING_CHANNEL_ID,
+                channel=channel_id,
                 blocks=message_blocks,
                 text=f"Weekly Resolution Leaderboard ({date_range})"
             )
         )
-        print(f"✓ Leaderboard posted successfully for {date_range}!")
+        print(f"\n✓ Leaderboard posted successfully for {date_range}!")
         
     except Exception as e:
-        print(f"✗ Error posting leaderboard: {e}")
+        print(f"\n✗ Error posting leaderboard: {e}")
         raise
 
 def main():
     """Main function to generate and post the leaderboard"""
-    print("=" * 60)
-    print("Support Resolution Leaderboard Generator")
-    print("=" * 60)
+    print("=" * 70)
+    print("Support Resolution Leaderboard Generator (Reaction-Based)")
+    print("=" * 70)
     
     # Validate configuration
     if SLACK_BOT_TOKEN == "xoxb-your-token-here":
-        print("Error: Please set SLACK_BOT_TOKEN environment variable or update script")
+        print("\nError: Please set SLACK_BOT_TOKEN environment variable")
+        print("Example: export SLACK_BOT_TOKEN='xoxb-...'")
         sys.exit(1)
     
-    if TRACKING_CHANNEL_ID == "C01ABC2DEF3":
-        print("Error: Please set TRACKING_CHANNEL_ID environment variable or update script")
+    if SUPPORT_CHANNEL_ID == "C01ABC2DEF3":
+        print("\nError: Please set SUPPORT_CHANNEL_ID environment variable")
+        print("Example: export SUPPORT_CHANNEL_ID='C01ABC2DEF3'")
         sys.exit(1)
     
-    # Parse command line arguments for week specification
+    # Parse command line arguments
     weeks_to_process = [0]  # Default: last week only
     
     if len(sys.argv) > 1:
@@ -374,6 +371,10 @@ def main():
             print("  python support_leaderboard.py              # Generate last week's leaderboard")
             print("  python support_leaderboard.py --weeks N    # Generate leaderboards for last N weeks")
             print("  python support_leaderboard.py --week N     # Generate leaderboard for N weeks ago")
+            print("\nEnvironment Variables:")
+            print("  SLACK_BOT_TOKEN         - Your Slack bot token (required)")
+            print("  SUPPORT_CHANNEL_ID      - Channel to read reactions from (required)")
+            print("  LEADERBOARD_CHANNEL_ID  - Where to post leaderboard (defaults to SUPPORT_CHANNEL_ID)")
             print("\nExamples:")
             print("  python support_leaderboard.py --weeks 3    # Catch up on last 3 weeks")
             print("  python support_leaderboard.py --week 2     # Generate for 2 weeks ago only")
@@ -382,51 +383,64 @@ def main():
         elif sys.argv[1] == "--weeks" and len(sys.argv) > 2:
             num_weeks = int(sys.argv[2])
             weeks_to_process = list(range(num_weeks))
-            print(f"Processing last {num_weeks} weeks (catching up)")
+            print(f"\nProcessing last {num_weeks} weeks (catching up)")
         
         elif sys.argv[1] == "--week" and len(sys.argv) > 2:
             specific_week = int(sys.argv[2])
             weeks_to_process = [specific_week]
-            print(f"Processing week from {specific_week} weeks ago")
+            print(f"\nProcessing week from {specific_week} weeks ago")
     
-    # Auto-detect workflow bot ID
-    print("\nDetecting workflow bot ID...")
-    detect_workflow_bot_id()
+    # Set leaderboard channel (defaults to support channel if not specified)
+    leaderboard_channel = LEADERBOARD_CHANNEL_ID if LEADERBOARD_CHANNEL_ID != "C01ABC2DEF3" else SUPPORT_CHANNEL_ID
+    
+    print(f"\nConfiguration:")
+    print(f"  Support channel: {SUPPORT_CHANNEL_ID}")
+    print(f"  Leaderboard channel: {leaderboard_channel}")
+    print(f"  Resolution emoji: :{RESOLUTION_EMOJI}:")
+    
+    # Verify bot connection
+    try:
+        auth_result = retry_api_call(lambda: client.auth_test())
+        print(f"  Bot connected as: {auth_result['user']}")
+    except Exception as e:
+        print(f"\n✗ Error: Could not authenticate with Slack: {e}")
+        sys.exit(1)
     
     # Process each week
     for weeks_ago in weeks_to_process:
-        print(f"\n{'─' * 60}")
+        print(f"\n{'─' * 70}")
         
         # Get week date range
         start_date, end_date = get_week_range(weeks_ago)
         date_range = f"{start_date.strftime('%b %d')} - {end_date.strftime('%b %d, %Y')}"
-        print(f"Processing week: {date_range}")
+        print(f"\nProcessing week: {date_range}")
         
         # Check for duplicate leaderboard
-        if check_for_duplicate_leaderboard(start_date, end_date):
-            print(f"⚠ Leaderboard already exists for {date_range}. Skipping to prevent duplicate.")
+        if check_for_duplicate_leaderboard(leaderboard_channel, start_date, end_date):
+            print(f"⚠ Leaderboard already exists for {date_range}. Skipping.")
             continue
         
-        # Get resolution counts
-        print("Fetching and validating resolution messages...")
-        resolutions = get_resolutions_for_week(start_date, end_date)
+        # Count resolutions by reading reactions
+        resolutions = count_resolutions_by_reactions(SUPPORT_CHANNEL_ID, start_date, end_date)
         
         if resolutions:
-            print(f"Found {sum(resolutions.values())} resolutions from {len(resolutions)} agents")
-        else:
-            print("No resolutions found for this week")
+            print(f"\nLeaderboard preview:")
+            for agent, count in resolutions.most_common(5):
+                print(f"  {agent}: {count} resolutions")
+            if len(resolutions) > 5:
+                print(f"  ... and {len(resolutions) - 5} more agents")
         
         # Post leaderboard
-        print("Posting leaderboard...")
-        post_leaderboard(resolutions, start_date, end_date)
+        print(f"\nPosting leaderboard to channel...")
+        post_leaderboard(resolutions, start_date, end_date, leaderboard_channel)
         
-        # Small delay between weeks if processing multiple
+        # Delay between weeks if processing multiple
         if weeks_ago != weeks_to_process[-1]:
             time.sleep(2)
     
-    print(f"\n{'=' * 60}")
+    print(f"\n{'=' * 70}")
     print("✓ Leaderboard generation complete!")
-    print("=" * 60)
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()
