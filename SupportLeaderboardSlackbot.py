@@ -10,7 +10,7 @@ from slack_sdk.errors import SlackApiError
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "xoxb-your-token-here")
 SUPPORT_CHANNEL_ID = os.environ.get("SUPPORT_CHANNEL_ID", "C01ABC2DEF3")  # #product-support-quick-questions
 LEADERBOARD_CHANNEL_ID = os.environ.get("LEADERBOARD_CHANNEL_ID", "C01ABC2DEF3")  # Where to post leaderboard
-RESOLUTION_EMOJI = "white_check_mark"  # The ✅ emoji (without colons)
+RESOLUTION_EMOJIS = ["white_check_mark", "check"]  # Both ✅ emojis (without colons)
 
 # Rate limiting configuration
 MAX_RETRIES = 3
@@ -178,9 +178,9 @@ def count_resolutions_by_reactions(channel_id, start_date, end_date):
         if not message.get("reactions"):
             continue
         
-        # Check if the resolution emoji is present
+        # Check if the resolution emoji is present (either white_check_mark or check)
         has_resolution_emoji = any(
-            r.get("name") == RESOLUTION_EMOJI 
+            r.get("name") in RESOLUTION_EMOJIS
             for r in message.get("reactions", [])
         )
         
@@ -193,8 +193,10 @@ def count_resolutions_by_reactions(channel_id, start_date, end_date):
         timestamp = message.get("ts")
         reactions = get_reactions_for_message(channel_id, timestamp)
         
-        # Get users who added the resolution emoji
-        resolver_ids = reactions.get(RESOLUTION_EMOJI, [])
+        # Get users who added either resolution emoji
+        resolver_ids = set()  # Use set to avoid duplicates if someone added both emojis
+        for emoji in RESOLUTION_EMOJIS:
+            resolver_ids.update(reactions.get(emoji, []))
         
         # Count resolution for each user who added the emoji
         for user_id in resolver_ids:
@@ -396,7 +398,7 @@ def main():
     print(f"\nConfiguration:")
     print(f"  Support channel: {SUPPORT_CHANNEL_ID}")
     print(f"  Leaderboard channel: {leaderboard_channel}")
-    print(f"  Resolution emoji: :{RESOLUTION_EMOJI}:")
+    print(f"  Resolution emojis: :{RESOLUTION_EMOJIS[0]}: and :{RESOLUTION_EMOJIS[1]}:")
     
     # Verify bot connection
     try:
